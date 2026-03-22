@@ -1,0 +1,230 @@
+package com.example.hive;
+
+import android.Manifest;
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.text.TextUtils;
+import android.util.Log;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+
+import com.google.android.gms.nearby.Nearby;
+import com.google.android.gms.nearby.connection.*;
+
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+
+public class BroadcastActivity extends AppCompatActivity {
+
+    private static final String TAG = "BroadcastActivity";
+    private static final String SERVICE_ID = "com.example.hive";
+    private static final Strategy STRATEGY = Strategy.P2P_CLUSTER;
+
+    private EditText etMessage;
+    private Button btnSend;
+    private TextView tvLog;
+    private ScrollView scrollLog;
+
+    private ConnectionsClient connectionsClient;
+    private String myNickname;
+    private final List<String> connectedEndpoints = new ArrayList<>();
+
+    private final Map<String, String> nicknameMap = new HashMap<>();
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (getSupportActionBar() != null)
+            getSupportActionBar().hide();
+        setContentView(R.layout.activity_broadcast);
+
+        etMessage = findViewById(R.id.etMessage);
+        btnSend = findViewById(R.id.btnSendBroadcast);
+        tvLog = findViewById(R.id.tvLog);
+        scrollLog = findViewById(R.id.scrollLog);
+
+        // Load Identity
+        // Load Identity
+        SharedPreferences prefs = getSharedPreferences("HivePrefs", Context.MODE_PRIVATE);
+        String rawName = prefs.getString("KEY_NICKNAME", "Survivor");
+        String uuid = prefs.getString("KEY_MY_UUID", UUID.randomUUID().toString());
+        // Ensure UUID is saved if it was just generated
+        if (!prefs.contains("KEY_MY_UUID")) {
+            prefs.edit().putString("KEY_MY_UUID", uuid).apply();
+        }
+
+        // DISCORD TAG STRATEGY
+        String suffix = uuid.substring(0, 4).toUpperCase();
+        myNickname = rawName + "#" + suffix; // e.g. "Jude#A1B2"
+
+        connectionsClient = Nearby.getConnectionsClient(this);
+
+        btnSend.setOnClickListener(v -> sendManualMessage());
+
+        appendLog("Initializing Radio as: " + myNickname);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        startAdvertising();
+        startDiscovery();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (connectionsClient != null) {
+            connectionsClient.stopAdvertising();
+            connectionsClient.stopDiscovery();
+            connectionsClient.stopAllEndpoints();
+            connectedEndpoints.clear();
+            MeshStateManager.connectedPeers.clear();
+            nicknameMap.clear();
+            appendLog("Radio Stopped.");
+        }
+    }
+
+    private void startAdvertising() {
+        AdvertisingOptions options = new AdvertisingOptions.Builder().setStrategy(STRATEGY).build();
+        connectionsClient.startAdvertising(myNickname, SERVICE_ID, connectionLifecycleCallback, options)
+                .addOnSuccessListener(v -> appendLog("Advertising Active."))
+                .addOnFailureListener(e -> appendLog("Adv Error: " + e.getMessage()));
+    }
+
+    private void startDiscovery() {
+        DiscoveryOptions options = new DiscoveryOptions.Builder().setStrategy(STRATEGY).build();
+        connectionsClient.startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
+                .addOnSuccessListener(v -> appendLog("Scanning for Uplinks..."))
+                .addOnFailureListener(e -> appendLog("Scan Error: " + e.getMessage()));
+    }
+
+    private void sendManualMessage() {
+        String msg = etMessage.getText().toString().trim();
+        if (TextUtils.isEmpty(msg))
+            return;
+
+        if (connectedEndpoints.isEmpty()) {
+            Toast.makeText(this, "No connected peers", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        Payload payload = Payload.fromBytes(msg.getBytes(StandardCharsets.UTF_8));
+        connectionsClient.sendPayload(connectedEndpoints, payload);
+
+        String time = new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date());
+        // Show MY nickname? Or just "YOU"? User requested clean chat.
+        // Usually "YOU" is better for self.
+        appendLog("[" + time + "] " + myNickname + ": " + msg);
+        etMessage.setText("");
+    }
+
+    // --- CALLBACKS ---
+
+    private final EndpointDiscoveryCallback endpointDiscoveryCallback = new EndpointDiscoveryCallback() {
+        @Override
+        public void onEndpointFound(@NonNull String endpointId, @NonNull DiscoveredEndpointInfo info) {
+            appendLog("Found Peer: " + info.getEndpointName());
+            // Auto Connect
+            connectionsClient.requestConnection(myNickname, endpointId, connectionLifecycleCallback)
+                    .addOnFailureListener(e -> Log.e(TAG, "Connect Fail", e));
+        }
+
+        @Override
+        public void onEndpointLost(@NonNull String endpointId) {
+            appendLog("Lost Peer: " + endpointId);
+        }
+    };
+
+    private final ConnectionLifecycleCallback connectionLifecycleCallback = new ConnectionLifecycleCallback() {
+        @Override
+        public void onConnectionInitiated(@NonNull String endpointId, @NonNull ConnectionInfo info) {
+            appendLog("Connection Initiated: " + info.getEndpointName());
+
+            // CAPTURE NAME
+            nicknameMap.put(endpointId, info.getEndpointName());
+
+            connectionsClient.acceptConnection(endpointId, payloadCallback);
+        }
+
+        @Override
+        public void onConnectionResult(@NonNull String endpointId, @NonNull ConnectionResolution result) {
+            if (result.getStatus().isSuccess()) {
+                connectedEndpoints.add(endpointId);
+
+                String name = nicknameMap.get(endpointId);
+                if (name == null)
+                    name = "Unknown";
+
+                // Add to static state for PeerListActivity
+                MeshStateManager.connectedPeers.add(new MeshStateManager.Peer(endpointId, name));
+
+                appendLog(">>> CONNECTED: " + name);
+            } else {
+                appendLog("Connection Failed");
+                nicknameMap.remove(endpointId);
+            }
+        }
+
+        @Override
+        public void onDisconnected(@NonNull String endpointId) {
+            appendLog("Disconnected: " + endpointId);
+            connectedEndpoints.remove(endpointId);
+            nicknameMap.remove(endpointId);
+
+            // REMOVE FROM STATIC STATE
+            for (int i = 0; i < MeshStateManager.connectedPeers.size(); i++) {
+                if (MeshStateManager.connectedPeers.get(i).id.equals(endpointId)) {
+                    MeshStateManager.connectedPeers.remove(i);
+                    break;
+                }
+            }
+        }
+    };
+
+    private final PayloadCallback payloadCallback = new PayloadCallback() {
+        @Override
+        public void onPayloadReceived(@NonNull String endpointId, @NonNull Payload payload) {
+            if (payload.getType() == Payload.Type.BYTES) {
+                String msg = new String(payload.asBytes(), StandardCharsets.UTF_8);
+                String time = new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date());
+
+                // LOOK UP NAME
+                String name = nicknameMap.get(endpointId);
+                if (name == null)
+                    name = endpointId.substring(0, 4); // Fallback
+
+                appendLog("[" + time + "] " + name + ": " + msg);
+            }
+        }
+
+        @Override
+        public void onPayloadTransferUpdate(@NonNull String endpointId, @NonNull PayloadTransferUpdate update) {
+        }
+    };
+
+    private void appendLog(String text) {
+        runOnUiThread(() -> {
+            tvLog.append(text + "\n"); // Append newline at end
+            scrollLog.post(() -> scrollLog.fullScroll(View.FOCUS_DOWN));
+        });
+    }
+}
